@@ -211,6 +211,22 @@ def fetch_upstream_lines_cached(
     """Return upstream lines from cache if fresh, otherwise download and cache.
 
     Falls back to a stale cache if the download fails.
+
+    Args:
+        url: Upstream URL to download.
+        timeout: Request timeout seconds.
+        retries: Number of retries after the initial attempt.
+        retry_delay: Base delay in seconds between retries.
+        verbose: Whether to print cache expiry details.
+        cache_file: Path to the local cache file.
+        cache_ttl: Cache TTL in seconds.
+        refresh_cache: If true, ignore existing cache and re-download.
+
+    Returns:
+        Upstream file lines.
+
+    Raises:
+        RuntimeError: If download fails and no cache is available.
     """
     if not refresh_cache and cache_file.exists():
         age = time.time() - cache_file.stat().st_mtime
@@ -223,11 +239,17 @@ def fetch_upstream_lines_cached(
             print(f"Loaded {len(lines)} lines from cache.")
             return lines
         if verbose:
-            print(f"Cache expired ({age:.0f}s old, TTL {cache_ttl:.0f}s); re-downloading.")
+            print(
+                f"Cache expired ({age:.0f}s old, TTL {cache_ttl:.0f}s); re-downloading."
+            )
 
     try:
         lines = fetch_upstream_lines(
-            url, timeout=timeout, retries=retries, retry_delay=retry_delay, verbose=verbose
+            url,
+            timeout=timeout,
+            retries=retries,
+            retry_delay=retry_delay,
+            verbose=verbose,
         )
         cache_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"Upstream list cached to {cache_file}")
@@ -243,7 +265,15 @@ def fetch_upstream_lines_cached(
 
 
 def load_geo_cache(cache_file: Path) -> dict[str, dict]:
-    """Load the IP geolocation cache from a JSON file."""
+    """Load the geolocation cache from a JSON file.
+
+    Args:
+        cache_file: Path to the JSON cache file.
+
+    Returns:
+        Mapping of cache keys to their stored entries, or empty dict on
+        missing or corrupt file.
+    """
     if not cache_file.exists():
         return {}
     try:
@@ -253,7 +283,12 @@ def load_geo_cache(cache_file: Path) -> dict[str, dict]:
 
 
 def save_geo_cache(cache: dict[str, dict], cache_file: Path) -> None:
-    """Persist the IP geolocation cache to a JSON file."""
+    """Persist the geolocation cache to a JSON file.
+
+    Args:
+        cache: Mapping of cache keys to their stored entries.
+        cache_file: Path to write the JSON cache file.
+    """
     cache_file.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
 
 
@@ -275,7 +310,11 @@ def resolve_domain_ips(domain: str, dns_server: str) -> set[str]:
             answers = resolver.resolve(domain, rdtype)
             for rdata in answers:
                 ips.add(rdata.address)
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
+        except (
+            dns.resolver.NXDOMAIN,
+            dns.resolver.NoAnswer,
+            dns.resolver.NoNameservers,
+        ):
             pass
         except dns.exception.DNSException:
             pass
@@ -292,13 +331,27 @@ def batch_lookup_countries(
 ) -> dict[str, str | None]:
     """Look up country codes for multiple IPs using the IPInfo batch API.
 
-    Sends up to IPINFO_BATCH_SIZE IPs per POST request.
-    Returns {ip: country_code_or_none}; failed IPs map to None.
+    Sends up to IPINFO_BATCH_SIZE IPs per POST request with retry/backoff.
+    Failed IPs are mapped to None rather than raising.
+
+    Args:
+        ips: Sorted list of IP addresses to look up.
+        token: IPInfo API token.
+        timeout: HTTP timeout seconds.
+        retries: Number of retries after initial attempt.
+        retry_delay: Base delay in seconds for exponential backoff.
+        verbose: Whether to print retry details.
+
+    Returns:
+        Mapping of each IP to its country code (uppercase) or None if the
+        lookup failed or the country field was absent.
     """
     results: dict[str, str | None] = {}
     total_chunks = (len(ips) + IPINFO_BATCH_SIZE - 1) // IPINFO_BATCH_SIZE
 
-    for chunk_idx, chunk_start in enumerate(range(0, len(ips), IPINFO_BATCH_SIZE), start=1):
+    for chunk_idx, chunk_start in enumerate(
+        range(0, len(ips), IPINFO_BATCH_SIZE), start=1
+    ):
         chunk = ips[chunk_start : chunk_start + IPINFO_BATCH_SIZE]
 
         if total_chunks > 1:
@@ -345,7 +398,9 @@ def batch_lookup_countries(
                 print(f"IPInfo batch request failed: {msg}", file=sys.stderr)
                 if 400 <= exc.code < 500 and exc.code not in (408, 429):
                     break
-            except (URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
+            except (
+                URLError, TimeoutError, socket.timeout, json.JSONDecodeError
+            ) as exc:
                 errors.append(str(exc))
                 print(f"IPInfo batch request failed: {exc}", file=sys.stderr)
 
@@ -359,7 +414,8 @@ def batch_lookup_countries(
         if not success:
             summary = "; ".join(errors[-3:]) if errors else "unknown error"
             print(
-                f"WARNING: IPInfo batch lookup failed after {attempts} attempt(s): {summary}",
+                f"WARNING: IPInfo batch lookup failed after {attempts} attempt(s): "
+                f"{summary}",
                 file=sys.stderr,
             )
             for ip in chunk:
@@ -452,9 +508,11 @@ def dedupe_local_file(
                 file=sys.stderr,
             )
 
-    geo_cache: dict[str, dict] = {} if refresh_geo_cache else load_geo_cache(geo_cache_file)
+    geo_cache: dict[str, dict] = (
+        {} if refresh_geo_cache else load_geo_cache(geo_cache_file)
+    )
     if verbose:
-        print(f"Geo cache loaded: {len(geo_cache)} IP entries from {geo_cache_file}")
+        print(f"Geo cache loaded: {len(geo_cache)} entries from {geo_cache_file}")
 
     local_text = local_path.read_text(encoding="utf-8")
     local_lines = local_text.splitlines()
@@ -513,7 +571,11 @@ def dedupe_local_file(
             domain_cache_hits += 1
             geo_results[domain] = DomainGeoResult(
                 domain=domain,
-                ips=set(entry.get("cn_ips", []) + entry.get("non_cn_ips", []) + entry.get("unknown_ips", [])),
+                ips=set(
+                    entry.get("cn_ips", [])
+                    + entry.get("non_cn_ips", [])
+                    + entry.get("unknown_ips", [])
+                ),
                 cn_ips=set(entry.get("cn_ips", [])),
                 non_cn_ips=set(entry.get("non_cn_ips", [])),
                 unknown_country_ips=set(entry.get("unknown_ips", [])),
@@ -523,12 +585,17 @@ def dedupe_local_file(
             domains_to_resolve.append(domain)
 
     if domain_cache_hits:
-        print(f"{domain_cache_hits}/{len(candidate_domains)} domain(s) served from geo cache.")
+        print(
+            f"{domain_cache_hits}/{len(candidate_domains)} domain(s) "
+            "served from geo cache."
+        )
 
     # Phase 2: resolve IPs for domains not covered by the domain cache.
     domain_ips: dict[str, set[str]] = {}
     if domains_to_resolve:
-        print(f"Resolving IPs for {len(domains_to_resolve)} domain(s) via {dns_server}...")
+        print(
+            f"Resolving IPs for {len(domains_to_resolve)} domain(s) via {dns_server}..."
+        )
         for idx, domain in enumerate(domains_to_resolve, start=1):
             if verbose:
                 print(f"  Resolving {idx}/{len(domains_to_resolve)}: {domain}")
@@ -565,7 +632,7 @@ def dedupe_local_file(
     elif all_unique_ips:
         print(f"All {len(all_unique_ips)} IP(s) served from IP cache.")
 
-    # Phase 4: build DomainGeoResult for resolved domains and store domain cache entries.
+    # Phase 4: build DomainGeoResult for resolved domains and write domain cache.
     now = time.time()
     for domain in domains_to_resolve:
         ips = domain_ips[domain]
@@ -627,11 +694,10 @@ def dedupe_local_file(
 
         if result.unresolved:
             unresolved_domains.append(domain)
-            final_lines.append(line)
-            print(f"WARNING: No resolvable IP for domain: {domain}")
+            removed_non_cn_lines.append(line)
+            removed_non_cn_domains.append(domain)
             continue
 
-        # Option A: keep if any CN IP exists.
         if result.cn_ips:
             final_lines.append(line)
             continue
@@ -658,9 +724,9 @@ def dedupe_local_file(
     print(f"Post-dedupe domains geo-evaluated: {len(candidate_domains)}")
     print(f"Geo domain cache hits: {domain_cache_hits} / {len(candidate_domains)}")
     print(f"Geo IP cache hits / misses: {ip_cache_hits} / {ip_cache_misses}")
-    print(f"Non-CN entries removed: {len(removed_non_cn_lines)}")
+    print(f"Non-CN / unresolved entries removed: {len(removed_non_cn_lines)}")
     print(f"Unique non-CN domains removed: {len(unique_non_cn_domains)}")
-    print(f"Unresolved domains kept (warnings): {len(unique_unresolved_domains)}")
+    print(f"Unresolved domains removed: {len(unique_unresolved_domains)}")
     print(f"Remaining local lines: {len(final_lines)}")
 
     if unique_duplicate_domains:
@@ -688,7 +754,7 @@ def dedupe_local_file(
     if unique_unresolved_domains:
         shown = unique_unresolved_domains[:show_examples]
         print("")
-        print(f"Sample unresolved domains kept (up to {show_examples}):")
+        print(f"Sample unresolved domains removed (up to {show_examples}):")
         for domain in shown:
             print(f"  - {domain}")
 
@@ -772,6 +838,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--verbose",
+        "-v",
         action="store_true",
         help="Print download/retry/geo progress details.",
     )
@@ -799,7 +866,10 @@ def main() -> int:
         "--geo-cache-file",
         type=Path,
         default=DEFAULT_GEO_CACHE_FILE,
-        help=f"Path to store the IP geolocation cache (default: {DEFAULT_GEO_CACHE_FILE}).",
+        help=(
+            "Path to store the IP geolocation cache "
+            f"(default: {DEFAULT_GEO_CACHE_FILE})."
+        ),
     )
     parser.add_argument(
         "--geo-cache-ttl",
