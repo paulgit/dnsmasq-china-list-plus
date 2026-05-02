@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import time
@@ -283,42 +284,65 @@ def load_geo_cache(cache_file: Path) -> dict[str, dict]:
 
 
 def save_geo_cache(cache: dict[str, dict], cache_file: Path) -> None:
-    """Persist the geolocation cache to a JSON file.
+    """Persist the geolocation cache to a JSON file atomically.
 
     Args:
         cache: Mapping of cache keys to their stored entries.
         cache_file: Path to write the JSON cache file.
     """
-    cache_file.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
+    tmp = cache_file.with_suffix(cache_file.suffix + ".tmp")
+    tmp.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, cache_file)
 
 
-def resolve_domain_ips(domain: str, dns_server: str) -> set[str]:
+def resolve_domain_ips(
+    domain: str,
+    dns_server: str,
+    dns_retries: int = 2,
+    dns_retry_delay: float = 1.0,
+) -> tuple[set[str], bool]:
     """Resolve both IPv4 and IPv6 addresses for a domain using a specific DNS server.
 
     Args:
         domain: Domain to resolve.
         dns_server: IP address of the DNS server to query.
+        dns_retries: Number of retries after the initial attempt.
+        dns_retry_delay: Base delay in seconds between retries.
 
     Returns:
-        Set of unique IP strings.
+        Tuple of (set of unique IP strings, whether resolution failed
+        transiently).  The second element is True only when all attempts
+        resulted in a timeout or server failure (not NXDOMAIN or NoAnswer).
     """
     resolver = dns.resolver.Resolver(configure=False)
     resolver.nameservers = [dns_server]
     ips: set[str] = set()
+    transient_fail = False
+
     for rdtype in ("A", "AAAA"):
-        try:
-            answers = resolver.resolve(domain, rdtype)
-            for rdata in answers:
-                ips.add(rdata.address)
-        except (
-            dns.resolver.NXDOMAIN,
-            dns.resolver.NoAnswer,
-            dns.resolver.NoNameservers,
-        ):
-            pass
-        except dns.exception.DNSException:
-            pass
-    return ips
+        for attempt in range(dns_retries + 1):
+            try:
+                answers = resolver.resolve(domain, rdtype)
+                for rdata in answers:
+                    ips.add(rdata.address)
+                transient_fail = False
+                break
+            except (
+                dns.resolver.NXDOMAIN,
+                dns.resolver.NoAnswer,
+                dns.resolver.NoNameservers,
+            ):
+                break
+            except dns.resolver.LifetimeTimeout:
+                transient_fail = True
+                if attempt < dns_retries:
+                    time.sleep(dns_retry_delay * (2 ** attempt))
+            except dns.exception.DNSException:
+                transient_fail = True
+                if attempt < dns_retries:
+                    time.sleep(dns_retry_delay * (2 ** attempt))
+
+    return ips, transient_fail
 
 
 def batch_lookup_countries(
@@ -328,11 +352,14 @@ def batch_lookup_countries(
     retries: int,
     retry_delay: float,
     verbose: bool,
+    fail_hard: bool = False,
 ) -> dict[str, str | None]:
     """Look up country codes for multiple IPs using the IPInfo batch API.
 
     Sends up to IPINFO_BATCH_SIZE IPs per POST request with retry/backoff.
-    Failed IPs are mapped to None rather than raising.
+    By default failed IPs are mapped to None rather than raising.  When
+    *fail_hard* is True the first unrecoverable batch failure raises
+    RuntimeError so callers can decide whether to discard data.
 
     Args:
         ips: Sorted list of IP addresses to look up.
@@ -341,10 +368,14 @@ def batch_lookup_countries(
         retries: Number of retries after initial attempt.
         retry_delay: Base delay in seconds for exponential backoff.
         verbose: Whether to print retry details.
+        fail_hard: If True, raise RuntimeError on unrecoverable batch failure.
 
     Returns:
         Mapping of each IP to its country code (uppercase) or None if the
         lookup failed or the country field was absent.
+
+    Raises:
+        RuntimeError: If *fail_hard* is True and a batch fails permanently.
     """
     results: dict[str, str | None] = {}
     total_chunks = (len(ips) + IPINFO_BATCH_SIZE - 1) // IPINFO_BATCH_SIZE
@@ -413,6 +444,10 @@ def batch_lookup_countries(
 
         if not success:
             summary = "; ".join(errors[-3:]) if errors else "unknown error"
+            if fail_hard:
+                raise RuntimeError(
+                    f"IPInfo batch lookup failed after {attempts} attempt(s): {summary}"
+                )
             print(
                 f"WARNING: IPInfo batch lookup failed after {attempts} attempt(s): "
                 f"{summary}",
@@ -508,11 +543,22 @@ def dedupe_local_file(
                 file=sys.stderr,
             )
 
-    geo_cache: dict[str, dict] = (
+    raw_geo_cache: dict[str, dict] = (
         {} if refresh_geo_cache else load_geo_cache(geo_cache_file)
     )
     if verbose:
-        print(f"Geo cache loaded: {len(geo_cache)} entries from {geo_cache_file}")
+        print(
+            f"Geo cache loaded: {len(raw_geo_cache)} entries from {geo_cache_file}"
+        )
+
+    # Separate IP-level cache from domain-level cache to avoid key collisions.
+    ip_cache: dict[str, dict] = {}
+    domain_cache: dict[str, dict] = {}
+    for key, entry in raw_geo_cache.items():
+        if key.startswith("domain:"):
+            domain_cache[key] = entry
+        else:
+            ip_cache[key] = entry
 
     local_text = local_path.read_text(encoding="utf-8")
     local_lines = local_text.splitlines()
@@ -566,7 +612,7 @@ def dedupe_local_file(
     domain_cache_hits = 0
 
     for domain in candidate_domains:
-        entry = geo_cache.get(f"domain:{domain}")
+        entry = domain_cache.get(f"domain:{domain}")
         if entry and (now - entry.get("cached_at", 0)) < effective_geo_ttl:
             domain_cache_hits += 1
             geo_results[domain] = DomainGeoResult(
@@ -592,6 +638,7 @@ def dedupe_local_file(
 
     # Phase 2: resolve IPs for domains not covered by the domain cache.
     domain_ips: dict[str, set[str]] = {}
+    dns_transient_failures: set[str] = set()
     if domains_to_resolve:
         print(
             f"Resolving IPs for {len(domains_to_resolve)} domain(s) via {dns_server}..."
@@ -599,19 +646,25 @@ def dedupe_local_file(
         for idx, domain in enumerate(domains_to_resolve, start=1):
             if verbose:
                 print(f"  Resolving {idx}/{len(domains_to_resolve)}: {domain}")
-            domain_ips[domain] = resolve_domain_ips(domain, dns_server)
+            ips, transient_fail = resolve_domain_ips(domain, dns_server)
+            domain_ips[domain] = ips
+            if transient_fail:
+                dns_transient_failures.add(domain)
 
     # Phase 3: batch-query IPInfo for any IPs not already in the IP cache.
     all_unique_ips = sorted({ip for ips in domain_ips.values() for ip in ips})
     ip_cache_miss_ips = [
-        ip for ip in all_unique_ips
+        ip
+        for ip in all_unique_ips
         if not (
-            geo_cache.get(ip)
-            and (now - geo_cache[ip].get("cached_at", 0)) < effective_geo_ttl
+            ip_cache.get(ip)
+            and (now - ip_cache[ip].get("cached_at", 0)) < effective_geo_ttl
         )
     ]
     ip_cache_hits = len(all_unique_ips) - len(ip_cache_miss_ips)
     ip_cache_misses = len(ip_cache_miss_ips)
+
+    ipinfo_fail_hard = bool(dns_transient_failures)
 
     if ip_cache_miss_ips:
         print(
@@ -625,10 +678,11 @@ def dedupe_local_file(
             retries=retries,
             retry_delay=retry_delay,
             verbose=verbose,
+            fail_hard=ipinfo_fail_hard,
         )
         now = time.time()
         for ip, country in fresh.items():
-            geo_cache[ip] = {"country": country, "cached_at": now}
+            ip_cache[ip] = {"country": country, "cached_at": now}
     elif all_unique_ips:
         print(f"All {len(all_unique_ips)} IP(s) served from IP cache.")
 
@@ -650,7 +704,7 @@ def dedupe_local_file(
             non_cn_ips: set[str] = set()
             unknown_country_ips: set[str] = set()
             for ip in ips:
-                entry = geo_cache.get(ip)
+                entry = ip_cache.get(ip)
                 country = entry.get("country") if entry else None
                 if country == "CN":
                     cn_ips.add(ip)
@@ -667,7 +721,7 @@ def dedupe_local_file(
                 unresolved=False,
             )
         geo_results[domain] = result
-        geo_cache[f"domain:{domain}"] = {
+        domain_cache[f"domain:{domain}"] = {
             "cn_ips": sorted(result.cn_ips),
             "non_cn_ips": sorted(result.non_cn_ips),
             "unknown_ips": sorted(result.unknown_country_ips),
@@ -675,7 +729,9 @@ def dedupe_local_file(
             "cached_at": now,
         }
 
-    save_geo_cache(geo_cache, geo_cache_file)
+    # Merge the two caches back together for persistence.
+    merged_geo_cache = {**ip_cache, **domain_cache}
+    save_geo_cache(merged_geo_cache, geo_cache_file)
     if verbose:
         print(f"Geo cache saved to {geo_cache_file}")
 
